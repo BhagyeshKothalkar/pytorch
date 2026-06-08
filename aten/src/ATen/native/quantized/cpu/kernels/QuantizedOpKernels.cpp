@@ -4159,38 +4159,60 @@ void dequantize_per_channel_affine_kernel(
   check_tensor_memory_format(qtensor, rtensor);
   const auto* qd = qtensor.const_data_ptr<Q>();
   float* rd = rtensor.data_ptr<float>();
-  const auto elem_per_byte = 8 / bit_width;
-  if (axis == 1 && (rtensor.is_contiguous(MemoryFormat::ChannelsLast) ||
-      rtensor.is_contiguous(MemoryFormat::ChannelsLast3d))) {
-    for (const auto b : c10::irange(batches)) {
-      for (const auto e : c10::irange(elements_per_channel)) {
-        for (const auto c : c10::irange(channel)) {
-          auto i = b * channel * elements_per_channel + e * channel + c;
-          // We need to convert the qint8 value to float to ensure the
-          // subtraction subexpression returns a float
-          auto qvalue = qd[i / elem_per_byte].val_;
-          if (bit_width < 8) {
-            qvalue >>= (i % elem_per_byte) * bit_width;
-            qvalue &= (1 << bit_width) - 1;
+  if(bit_width >= 8){
+    if (axis == 1 && (rtensor.is_contiguous(MemoryFormat::ChannelsLast) ||
+        rtensor.is_contiguous(MemoryFormat::ChannelsLast3d))) {
+      for (const auto b : c10::irange(batches)) {
+        for (const auto e : c10::irange(elements_per_channel)) {
+          for (const auto c : c10::irange(channel)) {
+            auto i = b * channel * elements_per_channel + e * channel + c;
+            auto qvalue = qd[i].val_; 
+            rd[i] = (static_cast<float>(qvalue) - zero_points_data[c]) * scales_data[c];
           }
-          rd[i] = (static_cast<float>(qvalue) - zero_points_data[c]) * scales_data[c];
+        }
+      }
+    } else {
+      for (const auto b : c10::irange(batches)) {
+        for (const auto c : c10::irange(channel)) {
+          for (const auto e : c10::irange(elements_per_channel)) {
+            auto i = b * channel * elements_per_channel + c * elements_per_channel + e;
+            auto qvalue = qd[i].val_;
+            rd[i] = (static_cast<float>(qvalue) - zero_points_data[c]) * scales_data[c];
+          }
         }
       }
     }
-  } else {
-    for (const auto b : c10::irange(batches)) {
-      for (const auto c : c10::irange(channel)) {
+  }
+  else{
+    const auto elem_per_byte = 8 / bit_width;
+    if (axis == 1 && (rtensor.is_contiguous(MemoryFormat::ChannelsLast) ||
+        rtensor.is_contiguous(MemoryFormat::ChannelsLast3d))) {
+      for (const auto b : c10::irange(batches)) {
         for (const auto e : c10::irange(elements_per_channel)) {
-          auto i = b * channel * elements_per_channel +
-              c * elements_per_channel + e;
-          // We need to convert the qint8 value to float to ensure the
-          // subtraction subexpression returns a float
-          auto qvalue = qd[i / elem_per_byte].val_;
-          if (bit_width < 8) {
+          for (const auto c : c10::irange(channel)) {
+            auto i = b * channel * elements_per_channel + e * channel + c;
+            // We need to convert the qint8 value to float to ensure the
+            // subtraction subexpression returns a float
+            auto qvalue = qd[i / elem_per_byte].val_;
             qvalue >>= (i % elem_per_byte) * bit_width;
             qvalue &= (1 << bit_width) - 1;
+            rd[i] = (static_cast<float>(qvalue) - zero_points_data[c]) * scales_data[c];
           }
-          rd[i] = (static_cast<float>(qvalue) - zero_points_data[c]) * scales_data[c];
+        }
+      }
+    } else {
+      for (const auto b : c10::irange(batches)) {
+        for (const auto c : c10::irange(channel)) {
+          for (const auto e : c10::irange(elements_per_channel)) {
+            auto i = b * channel * elements_per_channel +
+                c * elements_per_channel + e;
+            // We need to convert the qint8 value to float to ensure the
+            // subtraction subexpression returns a float
+            auto qvalue = qd[i / elem_per_byte].val_;
+            qvalue >>= (i % elem_per_byte) * bit_width;
+            qvalue &= (1 << bit_width) - 1;
+            rd[i] = (static_cast<float>(qvalue) - zero_points_data[c]) * scales_data[c];
+          }
         }
       }
     }
@@ -4235,36 +4257,66 @@ void quantize_tensor_per_channel_float_qparams_cpu(
         check_tensor_memory_format(rtensor, qtensor);
         const float* rdata = rtensor.const_data_ptr<float>();
         auto qdata = reinterpret_cast<underlying_t*>(qtensor.data_ptr<scalar_t>());
-        const auto elem_per_byte = CHAR_BIT / bit_width;
         int qvalue = 0;
-        if (axis == 1 && (rtensor.is_contiguous(MemoryFormat::ChannelsLast) ||
-            rtensor.is_contiguous(MemoryFormat::ChannelsLast3d))) {
-          for (const auto b : c10::irange(batches)) {
-            for (const auto e : c10::irange(elements_per_channel)) {
-              for (const auto c : c10::irange(channel)) {
-                auto i = b * channel * elements_per_channel + e * channel + c;
-                qvalue = quantize_val_float_qparams(
-                    scales_data[c], zero_points_data[c], rdata[i], quant_min, quant_max);
-                if (i % elem_per_byte == 0) {
-                  qdata[i / elem_per_byte] = static_cast<underlying_t>(qvalue);
-                } else {
-                  qdata[i / elem_per_byte] |= static_cast<underlying_t>(qvalue << ((i % elem_per_byte) * bit_width));
+        if constexpr (bit_width >= 8){
+          if (axis == 1 && (rtensor.is_contiguous(MemoryFormat::ChannelsLast) || ...)) {
+            for (const auto b : c10::irange(batches)) {
+              for (const auto e : c10::irange(elements_per_channel)) {
+                for (const auto c : c10::irange(channel)) {
+                  auto i = b * channel * elements_per_channel + e * channel + c;
+                  qvalue = quantize_val_float_qparams(
+                      scales_data[c], zero_points_data[c], rdata[i], quant_min, quant_max);
+                  qdata[i] = static_cast<underlying_t>(qvalue);
                 }
               }
             }
           }
-        } else {
-          for (const auto b : c10::irange(batches)) {
-            for (const auto c : c10::irange(channel)) {
+          else{
+            for (const auto b : c10::irange(batches)) {
+              for (const auto c : c10::irange(channel)) {
+                for (const auto e : c10::irange(elements_per_channel)) {
+                  auto i = b * channel * elements_per_channel +
+                      c * elements_per_channel + e;
+                  qvalue = quantize_val_float_qparams(
+                      scales_data[c], zero_points_data[c], rdata[i], quant_min, quant_max);
+                    qdata[i] = static_cast<underlying_t>(qvalue);
+                }
+              }
+            }
+          }
+        }
+        else{
+          const auto elem_per_byte = CHAR_BIT / bit_width;
+          if (axis == 1 && (rtensor.is_contiguous(MemoryFormat::ChannelsLast) ||
+              rtensor.is_contiguous(MemoryFormat::ChannelsLast3d))) {
+            for (const auto b : c10::irange(batches)) {
               for (const auto e : c10::irange(elements_per_channel)) {
-                auto i = b * channel * elements_per_channel +
-                    c * elements_per_channel + e;
-                qvalue = quantize_val_float_qparams(
-                    scales_data[c], zero_points_data[c], rdata[i], quant_min, quant_max);
-                if (i % elem_per_byte == 0) {
-                  qdata[i / elem_per_byte] = static_cast<underlying_t>(qvalue);
-                } else {
-                  qdata[i / elem_per_byte] |= static_cast<underlying_t>(qvalue << ((i % elem_per_byte) * bit_width));
+                for (const auto c : c10::irange(channel)) {
+                  auto i = b * channel * elements_per_channel + e * channel + c;
+                  qvalue = quantize_val_float_qparams(
+                      scales_data[c], zero_points_data[c], rdata[i], quant_min, quant_max);
+                  if (i % elem_per_byte == 0) {
+                    qdata[i / elem_per_byte] = static_cast<underlying_t>(qvalue);
+                  } else {
+                    qdata[i / elem_per_byte] |= static_cast<underlying_t>(qvalue << ((i % elem_per_byte) * bit_width));
+                  }
+                }
+              }
+            }
+          } 
+          else {
+            for (const auto b : c10::irange(batches)) {
+              for (const auto c : c10::irange(channel)) {
+                for (const auto e : c10::irange(elements_per_channel)) {
+                  auto i = b * channel * elements_per_channel +
+                      c * elements_per_channel + e;
+                  qvalue = quantize_val_float_qparams(
+                      scales_data[c], zero_points_data[c], rdata[i], quant_min, quant_max);
+                  if (i % elem_per_byte == 0) {
+                    qdata[i / elem_per_byte] = static_cast<underlying_t>(qvalue);
+                  } else {
+                    qdata[i / elem_per_byte] |= static_cast<underlying_t>(qvalue << ((i % elem_per_byte) * bit_width));
+                  }
                 }
               }
             }
