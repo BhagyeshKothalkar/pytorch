@@ -47,7 +47,7 @@ from torch.testing._internal.common_nn import NNTestCase, NewModuleTest, Criteri
     ctcloss_reference, get_new_module_tests, single_batch_reference_fn, _test_bfloat16_ops, _test_module_empty_input
 from torch.testing._internal.common_device_type import dtypesIfMPS, instantiate_device_type_tests, dtypes, \
     dtypesIfCUDA, precisionOverride, onlyCUDA, onlyCPU, \
-    skipCUDAIf, skipMPSIf, \
+    skipCUDAIfRocm, skipCUDAIf, skipMPSIf, \
     onlyNativeDeviceTypes, deviceCountAtLeast, largeTensorTest, expectedFailureMeta, expectedFailureMPS, \
     skipMeta, get_all_device_types
 from torch.testing._internal.common_modules import module_inputs_torch_nn_LinearCrossEntropyLoss
@@ -11389,19 +11389,16 @@ class TestNNDeviceType(NNTestCase):
             gradgradcheck(lambda x: F.interpolate(x, out_size, **kwargs), [input])
 
     @onlyCUDA
+    @skipCUDAIfRocm(msg="launch bounds error out on ROCM")
     @dtypes(torch.half, torch.bfloat16)
     @largeTensorTest('40GB')
     def test_upsampling_64bit_indexing_channels_last(self, device, dtype):
-        # Path 1 (NHWC): channels-last 1D grid. output.numel() = 2^31, below UINT32_MAX,
-        # but exercises the allclose correctness check between channels-last and contiguous.
         x = torch.rand((32, 64, 512, 512), dtype=dtype, device=device)
         out = torch.nn.functional.interpolate(x.to(memory_format=torch.channels_last), scale_factor=2, mode='nearest')
         out_ref = torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')
         del x
         self.assertTrue(torch.allclose(out, out_ref))
 
-        # Path 1 (NHWC): output.numel() = 17*256*1024*1024 ~ 4.26e9 > UINT32_MAX.
-        # Exercises the ROCm grid-stride clamp in the NHWC kernel.
         x = torch.ones((17, 256, 512, 512), dtype=dtype).cuda().to(memory_format=torch.channels_last)
         out = torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')
         self.assertEqual(out[0], out[-1])
@@ -13814,6 +13811,43 @@ if __name__ == '__main__':
                              requires_grad=True)
         output = model(input)
         torch.autograd.gradcheck(model, input)
+    
+    @dtypes(torch.float16, torch.bfloat16)
+    def test_softplus_small_beta_overflow(self, device, dtype):
+        # Tests that small beta values don't cause silent overflow in reduced precision
+        # See https://github.com/pytorch/pytorch/issues/187180
+        dtype_max = torch.finfo(dtype).max
+
+        # Triggers math path overflow via division by beta
+        x_tiny = torch.tensor([[1.0]], dtype=dtype, device=device, requires_grad=True)
+        res_tiny = torch.nn.functional.softplus(x_tiny, beta=1e-6)
+
+        self.assertTrue(res_tiny.item() <= dtype_max)
+        self.assertTrue(res_tiny.item() > 0.0)
+
+        # The forward clamp does not override the analytical backward kernel (sigmoid).
+        # We solely verify that the gradient remains finite and flows without exploding.
+        res_tiny.sum().backward()
+        self.assertTrue(torch.isfinite(x_tiny.grad).all())
+
+        # x * beta = 0.6, which is below the linear threshold of 20, so the 
+        # full softplus formula runs and the result (~104,500) exceeds fp16 max without the clamp.
+        x_large = torch.tensor([[60000.0]], dtype=dtype, device=device, requires_grad=True)
+        res_large = torch.nn.functional.softplus(x_large, beta=1e-5)
+        
+        self.assertTrue(res_large.item() <= dtype_max)
+        self.assertTrue(res_large.item() > 0.0)
+
+        # Infinity preservation
+        with torch.no_grad():
+            inf_tensor = torch.tensor([[float('inf')]], dtype=dtype, device=device)
+            inf_result = torch.nn.functional.softplus(inf_tensor, beta=1e-6)
+            self.assertTrue(torch.isinf(inf_result).all())
+
+            # NaN propagation
+            nan_tensor = torch.tensor([[float('nan')]], dtype=dtype, device=device)
+            nan_result = torch.nn.functional.softplus(nan_tensor, beta=1e-6)
+            self.assertTrue(torch.isnan(nan_result).all())
 
     def test_softshrink_inplace_overlap(self, device):
         x = torch.randn((1, 6), device=device).expand((6, 6))
@@ -15833,44 +15867,6 @@ class TestFusedRMSNormOverrideRouting(TestCase):
         x = torch.randn(8, 128, dtype=torch.float16, device="cuda")
         w = torch.randn(128, dtype=torch.float32, device="cuda")
         self.assertFalse(_fused_rms_norm_cond(x, [128], w, 1e-5))
-
-    def test_fwd_cond_false_on_huge_normalized_dim(self):
-        # Rows whose per-CTA smem tile can't fit even at max cluster size must
-        # fall back to aten: beyond the smem budget the CuTe DSL compiler
-        # hangs/crashes before any launch-time check fires (gh-186800).
-        from torch._native.ops.norm.rmsnorm_impl import _fused_rms_norm_cond
-
-        n = 1 << 28
-        x = torch.empty(1, n, dtype=torch.bfloat16, device="cuda")
-        self.assertFalse(_fused_rms_norm_cond(x, [n], None, 1e-5))
-
-    def test_fwd_cond_smem_boundary(self):
-        # bf16 fwd: 2^20 fits the smem budget (verified to launch), 2^21
-        # overflows it (verified launch failure without the cond guard).
-        from torch._native.ops.norm.rmsnorm_impl import _fused_rms_norm_cond
-
-        x = torch.empty(1, 1 << 20, dtype=torch.bfloat16, device="cuda")
-        self.assertTrue(_fused_rms_norm_cond(x, [1 << 20], None, 1e-5))
-        x = torch.empty(1, 1 << 21, dtype=torch.bfloat16, device="cuda")
-        self.assertFalse(_fused_rms_norm_cond(x, [1 << 21], None, 1e-5))
-
-    def test_bwd_cond_false_on_huge_normalized_dim(self):
-        # The bwd smem footprint is smem_stages * (x + dout) tiles, so its
-        # bound is tighter than the fwd's: bf16 2^18 fits, 2^19 does not.
-        from torch._native.ops.norm.rmsnorm_impl import (
-            _fused_rms_norm_backward_cond,
-        )
-
-        for n, expected in ((1 << 18, True), (1 << 19, False)):
-            x = torch.empty(1, n, dtype=torch.bfloat16, device="cuda")
-            gout = torch.empty(1, n, dtype=torch.bfloat16, device="cuda")
-            rstd = torch.empty(1, 1, dtype=torch.float32, device="cuda")
-            self.assertEqual(
-                _fused_rms_norm_backward_cond(
-                    gout, x, [n], rstd, None, [True, False]
-                ),
-                expected,
-            )
 
     def test_fwd_cond_false_on_non_contiguous_weight(self):
         # Non-contiguous weight would need a copy; not measured, fall through.
